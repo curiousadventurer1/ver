@@ -4,7 +4,6 @@ import asyncio
 from PIL import Image
 from aiogram import Bot, Dispatcher, types, F
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
 
 # خواندن اطلاعات از بخش Variables در Railway
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -36,10 +35,15 @@ def clean_image_metadata(input_path: str, output_path: str):
 async def upload_doc_to_sheerid(verify_url: str, image_path: str, user_id: int):
     """باز کردن لینک ایمیل SheerID و آپلود مدرک"""
     async with async_playwright() as p:
-        # کانفیگ اجرای مرورگر در محیط Docker/Railway
+        # کانفیگ اجرای مرورگر در محیط Docker/Railway به همراه غیرفعال کردن فلگ اتوماسیون
         launch_args = {
             "headless": True,
-            "args": ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+            "args": [
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled"
+            ]
         }
         
         if PROXY_SERVER:
@@ -58,9 +62,21 @@ async def upload_doc_to_sheerid(verify_url: str, image_path: str, user_id: int):
             timezone_id="America/New_York"
         )
 
-        page = await context.new_page()
-        await stealth_async(page)
+        # جایگزین بومی و بدون خطای playwright-stealth برای مخفی کردن webdriver
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+            window.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en']
+            });
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5]
+            });
+        """)
 
+        page = await context.new_page()
         result_screenshot = f"result_{user_id}.png"
 
         try:
