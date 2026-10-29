@@ -1,13 +1,13 @@
 import os
 import random
 import asyncio
+from typing import List, Dict
 from PIL import Image
 from aiogram import Bot, Dispatcher, types, F
 from playwright.async_api import async_playwright
 
-# خواندن اطلاعات از بخش Variables در Railway
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-PROXY_SERVER = os.getenv("PROXY_SERVER", "")      # مثال: http://gate.smartproxy.com:7000
+PROXY_SERVER = os.getenv("PROXY_SERVER", "")
 PROXY_USERNAME = os.getenv("PROXY_USERNAME", "")
 PROXY_PASSWORD = os.getenv("PROXY_PASSWORD", "")
 
@@ -16,6 +16,9 @@ if not BOT_TOKEN:
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+# دیکشنری موقت برای جمع‌آوری عکس‌های یک آلبوم (Media Group)
+album_buffer: Dict[str, List[types.Message]] = {}
 
 
 def clean_image_metadata(input_path: str, output_path: str):
@@ -32,10 +35,16 @@ def clean_image_metadata(input_path: str, output_path: str):
         clean_img.save(output_path, "JPEG", quality=random.randint(92, 98))
 
 
-async def upload_doc_to_sheerid(verify_url: str, image_path: str, user_id: int):
-    """باز کردن لینک ایمیل SheerID و آپلود مدرک"""
+def merge_images_to_pdf(image_paths: List[str], pdf_path: str):
+    """ترکیب چند عکس در یک فایل PDF چندصفحه‌ای (برای مواقعی که سایت فقط ۱ فایل قبول می‌کند)"""
+    images = [Image.open(p).convert("RGB") for p in image_paths]
+    if images:
+        images[0].save(pdf_path, save_all=True, append_images=images[1:])
+
+
+async def upload_docs_to_sheerid(verify_url: str, image_paths: List[str], user_id: int):
+    """باز کردن لینک ایمیل SheerID و آپلود یک یا چند مدرک"""
     async with async_playwright() as p:
-        # کانفیگ اجرای مرورگر در محیط Docker/Railway به همراه غیرفعال کردن فلگ اتوماسیون
         launch_args = {
             "headless": True,
             "args": [
@@ -62,18 +71,11 @@ async def upload_doc_to_sheerid(verify_url: str, image_path: str, user_id: int):
             timezone_id="America/New_York"
         )
 
-        # جایگزین بومی و بدون خطای playwright-stealth برای مخفی کردن webdriver
         await context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined
-            });
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             window.chrome = { runtime: {} };
-            Object.defineProperty(navigator, 'languages', {
-                get: () => ['en-US', 'en']
-            });
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => [1, 2, 3, 4, 5]
-            });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
         """)
 
         page = await context.new_page()
@@ -87,7 +89,7 @@ async def upload_doc_to_sheerid(verify_url: str, image_path: str, user_id: int):
             if "vpn" in page_content.lower() and "not allowed" in page_content.lower():
                 await page.screenshot(path=result_screenshot, full_page=True)
                 await browser.close()
-                return False, "❌ خطای شناسایی VPN/Server IP توسط SheerID. پروکسی خانگی آمریکا را در Variables تنظیم کنید.", result_screenshot
+                return False, "❌ خطای شناسایی VPN/Server IP توسط SheerID. پروکسی خانگی آمریکا را تنظیم کنید.", result_screenshot
 
             # پیدا کردن تگ آپلود فایل
             target_frame = page
@@ -103,9 +105,45 @@ async def upload_doc_to_sheerid(verify_url: str, image_path: str, user_id: int):
             if await file_input.count() == 0:
                 await page.screenshot(path=result_screenshot, full_page=True)
                 await browser.close()
-                return False, "⚠️ فیلد آپلود فایل در این لینک پیدا نشد (اسکرین‌شات صفحه را بررسی کنید).", result_screenshot
+                return False, "⚠️ فیلد آپلود فایل در این لینک پیدا نشد (اسکرین‌شات را بررسی کنید).", result_screenshot
 
-            await file_input.first.set_input_files(image_path, timeout=20000)
+            # آپلود فایل‌ها (تک‌عکس یا چندعکس)
+            if len(image_paths) == 1:
+                await file_input.first.set_input_files(image_paths[0], timeout=20000)
+            else:
+                # بررسی اینکه آیا فیلد آپلود قابلیت دریافت چند فایل همزمان (multiple) را دارد؟
+                is_multiple = await file_input.first.get_attribute("multiple")
+                if is_multiple is not None:
+                    await file_input.first.set_input_files(image_paths, timeout=20000)
+                else:
+                    # تلاش برای آپلود تک‌به‌تک در فیلدهای مجزا یا کلیک روی دکمه Add another file
+                    uploaded_all = True
+                    for idx, img_path in enumerate(image_paths):
+                        inputs = target_frame.locator('input[type="file"]')
+                        if idx < await inputs.count():
+                            await inputs.nth(idx).set_input_files(img_path, timeout=15000)
+                            await asyncio.sleep(2)
+                        else:
+                            # جستجوی دکمه اضافه کردن فایل جدید در SheerID
+                            add_btn = target_frame.locator('button:has-text("Add"), a:has-text("Add"), [class*="add-file"]')
+                            if await add_btn.count() > 0 and await add_btn.first.is_visible():
+                                await add_btn.first.click()
+                                await asyncio.sleep(1)
+                                inputs = target_frame.locator('input[type="file"]')
+                                await inputs.last.set_input_files(img_path, timeout=15000)
+                                await asyncio.sleep(2)
+                            else:
+                                uploaded_all = False
+                                break
+
+                    # اگر صفحه فقط ۱ فایل قبول می‌کرد، همه عکس‌ها را به یک PDF تبدیل و آپلود می‌کنیم
+                    if not uploaded_all:
+                        pdf_path = f"merged_{user_id}.pdf"
+                        merge_images_to_pdf(image_paths, pdf_path)
+                        await file_input.first.set_input_files(pdf_path, timeout=20000)
+                        if os.path.exists(pdf_path):
+                            os.remove(pdf_path)
+
             await asyncio.sleep(3)
 
             # پیدا کردن و کلیک روی دکمه ارسال
@@ -128,13 +166,13 @@ async def upload_doc_to_sheerid(verify_url: str, image_path: str, user_id: int):
             if not clicked:
                 await page.screenshot(path=result_screenshot, full_page=True)
                 await browser.close()
-                return False, "⚠️ فایل انتخاب شد اما دکمه Submit فعال نشد یا نیاز به پر کردن فیلد دیگری در صفحه است.", result_screenshot
+                return False, "⚠️ فایل‌ها انتخاب شدند اما دکمه Submit فعال نشد.", result_screenshot
 
             await asyncio.sleep(10)
             await page.screenshot(path=result_screenshot, full_page=True)
             await browser.close()
             
-            return True, "✅ مدرک با موفقیت آپلود و ارسال شد!", result_screenshot
+            return True, f"✅ تعداد {len(image_paths)} مدرک با موفقیت آپلود و ارسال شد!", result_screenshot
 
         except Exception as e:
             try:
@@ -145,50 +183,89 @@ async def upload_doc_to_sheerid(verify_url: str, image_path: str, user_id: int):
             return False, f"❌ خطا:\n{str(e)}", result_screenshot
 
 
+async def process_messages(messages: List[types.Message]):
+    """پردازش یک پیام یا مجموعه‌ای از پیام‌های آلبوم"""
+    first_msg = messages[0]
+    
+    # پیدا کردن کپشن در بین عکس‌های آلبوم
+    caption = ""
+    for m in messages:
+        if m.caption and "http" in m.caption:
+            caption = m.caption
+            break
+
+    if not caption:
+        await first_msg.reply("⚠️ لطفاً در کپشنِ عکس (یا آلبوم عکس‌ها)، لینک دریافتی از ایمیل SheerID را قرار دهید.")
+        return
+
+    verify_url = next((word.strip() for word in caption.split() if word.startswith("http")), "")
+    status_msg = await first_msg.reply(f"⏳ در حال دانلود {len(messages)} مدرک، پاکسازی متادیتا و ارسال به SheerID...")
+
+    user_id = first_msg.from_user.id
+    raw_files = []
+    clean_files = []
+
+    try:
+        # دانلود و پاکسازی تک‌تک عکس‌ها
+        for idx, m in enumerate(messages):
+            raw_path = f"raw_{user_id}_{idx}.jpg"
+            clean_path = f"clean_{user_id}_{idx}.jpg"
+            
+            file_id = m.photo[-1].file_id if m.photo else m.document.file_id
+            file_info = await bot.get_file(file_id)
+            await bot.download_file(file_info.file_path, raw_path)
+            
+            clean_image_metadata(raw_path, clean_path)
+            raw_files.append(raw_path)
+            clean_files.append(clean_path)
+
+        # ارسال به SheerID
+        success, msg_text, screenshot_path = await upload_docs_to_sheerid(verify_url, clean_files, user_id)
+
+        if os.path.exists(screenshot_path):
+            await first_msg.reply_photo(photo=types.FSInputFile(screenshot_path), caption=msg_text)
+            os.remove(screenshot_path)
+        else:
+            await first_msg.reply(msg_text)
+
+    finally:
+        # پاک کردن فایل‌های موقت از سرور
+        for f in raw_files + clean_files:
+            if os.path.exists(f):
+                os.remove(f)
+        await status_msg.delete()
+
+
 @dp.message(F.text == "/start")
 async def cmd_start(message: types.Message):
     await message.reply(
         "👋 سلام!\n"
-        "عکس اسکرین‌شات پورتال دانشجو را بفرستید و در **کپشن (توضیحات عکس)**، لینک دریافتی از ایمیل SheerID را قرار دهید.",
+        "می‌توانید **یک عکس** یا **چند عکس همزمان (به صورت آلبوم)** بفرستید و در **کپشن** آن، لینک دریافتی از ایمیل SheerID را قرار دهید.",
         parse_mode="Markdown"
     )
 
 
 @dp.message(F.photo | F.document)
 async def handle_upload(message: types.Message):
-    caption = message.caption
-    if not caption or "http" not in caption:
-        await message.reply("⚠️ لطفاً در کپشن عکس، لینک دریافتی از ایمیل SheerID را قرار دهید.")
-        return
-
-    verify_url = next((word.strip() for word in caption.split() if word.startswith("http")), "")
-    status_msg = await message.reply("⏳ در حال پردازش و ارسال مدرک به SheerID...")
-
-    user_id = message.from_user.id
-    raw_image = f"raw_{user_id}.jpg"
-    clean_image = f"clean_{user_id}.jpg"
-
-    file_id = message.photo[-1].file_id if message.photo else message.document.file_id
-    file_info = await bot.get_file(file_id)
-    await bot.download_file(file_info.file_path, raw_image)
-
-    clean_image_metadata(raw_image, clean_image)
-    success, msg_text, screenshot_path = await upload_doc_to_sheerid(verify_url, clean_image, user_id)
-
-    if os.path.exists(screenshot_path):
-        await message.reply_photo(photo=types.FSInputFile(screenshot_path), caption=msg_text)
-        os.remove(screenshot_path)
+    # اگر کاربر چند عکس را به صورت آلبوم (Media Group) فرستاده باشد
+    if message.media_group_id:
+        mg_id = message.media_group_id
+        if mg_id not in album_buffer:
+            album_buffer[mg_id] = [message]
+            # ۲ ثانیه صبر می‌کند تا تمام عکس‌های آلبوم از تلگرام برسند، سپس پردازش را شروع می‌کند
+            await asyncio.sleep(2.5)
+            messages = album_buffer.pop(mg_id, [])
+            if messages:
+                await process_messages(messages)
+        else:
+            album_buffer[mg_id].append(message)
     else:
-        await message.reply(msg_text)
-
-    for f in [raw_image, clean_image]:
-        if os.path.exists(f):
-            os.remove(f)
-    await status_msg.delete()
+        # اگر فقط یک عکس فرستاده باشد
+        await process_messages([message])
 
 
 async def main():
-    print("🚀 Bot is running on Railway...")
+    print("🚀 Bot is running on Railway (Multi-Photo Supported)...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
